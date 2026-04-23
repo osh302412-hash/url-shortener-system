@@ -5,8 +5,10 @@ import com.urlshortener.model.CreateUrlResponse
 import com.urlshortener.model.ShortUrl
 import com.urlshortener.repository.ShortUrlRepository
 import com.urlshortener.util.Base62Encoder
+import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.data.redis.core.StringRedisTemplate
+import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import java.time.Duration
@@ -21,9 +23,11 @@ class UrlShortenerService(
     @Value("\${url-shortener.cache-ttl-seconds}") private val cacheTtlSeconds: Long
 ) {
     private val counter = AtomicLong(System.currentTimeMillis())
+    private val log = LoggerFactory.getLogger(javaClass)
 
     companion object {
-        private const val CACHE_PREFIX = "url:"
+        private const val CACHE_PREFIX  = "url:"
+        private const val CLICK_PREFIX  = "click:"  // write-behind 버퍼
     }
 
     fun createShortUrl(request: CreateUrlRequest): CreateUrlResponse {
@@ -35,7 +39,6 @@ class UrlShortenerService(
             expireAt = request.expireAt
         )
         shortUrlRepository.save(shortUrl)
-
         cacheUrl(shortKey, request.longUrl, request.expireAt)
 
         return CreateUrlResponse(
@@ -44,27 +47,47 @@ class UrlShortenerService(
         )
     }
 
-    @Transactional
     fun resolve(key: String): String? {
         // 1. Redis lookup
         val cached = redisTemplate.opsForValue().get("$CACHE_PREFIX$key")
         if (cached != null) {
-            shortUrlRepository.incrementClickCount(key)
+            // Write-Behind: DB write 없이 Redis 카운터만 증가 (O(1), non-blocking)
+            redisTemplate.opsForValue().increment("$CLICK_PREFIX$key")
             return cached
         }
 
-        // 2. DB lookup
+        // 2. DB lookup (캐시 미스)
         val shortUrl = shortUrlRepository.findByShortKey(key) ?: return null
 
-        // 3. Check expiration
+        // 3. 만료 확인
         if (shortUrl.expireAt != null && shortUrl.expireAt.isBefore(LocalDateTime.now())) {
             return null
         }
 
-        // 4. Cache and return
+        // 4. 캐시 저장 후 반환 (DB click count는 flush 스케줄러가 처리)
         cacheUrl(key, shortUrl.longUrl, shortUrl.expireAt)
-        shortUrlRepository.incrementClickCount(key)
+        redisTemplate.opsForValue().increment("$CLICK_PREFIX$key")
         return shortUrl.longUrl
+    }
+
+    // 10초마다 Redis에 쌓인 클릭 수를 DB에 일괄 반영 (Write-Behind flush)
+    @Scheduled(fixedDelay = 10_000)
+    @Transactional
+    fun flushClickCounts() {
+        val keys = redisTemplate.keys("$CLICK_PREFIX*")
+        if (keys.isNullOrEmpty()) return
+
+        var flushed = 0
+        for (redisKey in keys) {
+            val countStr = redisTemplate.opsForValue().getAndDelete(redisKey) ?: continue
+            val count = countStr.toLongOrNull() ?: continue
+            if (count <= 0) continue
+
+            val shortKey = redisKey.removePrefix(CLICK_PREFIX)
+            shortUrlRepository.addClickCount(shortKey, count)
+            flushed++
+        }
+        if (flushed > 0) log.debug("Click flush: {}개 key, DB 반영 완료", flushed)
     }
 
     private fun generateUniqueKey(): String {
@@ -84,6 +107,4 @@ class UrlShortenerService(
         }
         redisTemplate.opsForValue().set("$CACHE_PREFIX$key", longUrl, ttl)
     }
-
-
 }

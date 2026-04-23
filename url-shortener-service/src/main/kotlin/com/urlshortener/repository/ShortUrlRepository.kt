@@ -11,4 +11,8 @@ interface ShortUrlRepository : JpaRepository<ShortUrl, Long> {
     @Modifying
     @Query("UPDATE ShortUrl s SET s.clickCount = s.clickCount + 1 WHERE s.shortKey = :shortKey")
     fun incrementClickCount(shortKey: String)
+
+    @Modifying
+    @Query("UPDATE ShortUrl s SET s.clickCount = s.clickCount + :delta WHERE s.shortKey = :shortKey")
+    fun addClickCount(shortKey: String, delta: Long)
 }
